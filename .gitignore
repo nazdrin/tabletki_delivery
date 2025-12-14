@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+debug_html/
+*.log
+*.xlsx
+*.json
+
+# credentials / keys
+*.pem
+*.key
+*credentials*.json
+service_account*.json
+
+# IDE
+.vscode/
+.idea/
