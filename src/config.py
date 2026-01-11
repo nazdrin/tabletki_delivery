@@ -2,13 +2,49 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from datetime import time
 
 from dotenv import load_dotenv
 
 __all__ = ["Settings", "load_settings"]
+
+
+
+def _parse_list(raw: str) -> list[str]:
+    """Parse a list from env allowing separators: comma, semicolon, pipe."""
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    parts = re.split(r"[|;,]+", raw)
+    return [x.strip() for x in parts if x and x.strip()]
+
+
+def _parse_int_set(raw: str) -> set[int]:
+    """Parse a set of ints from env allowing separators: comma, semicolon, pipe."""
+    out: set[int] = set()
+    for p in _parse_list(raw):
+        try:
+            out.add(int(p))
+        except ValueError:
+            continue
+    return out
+
+
+def _parse_time_hhmm(s: str, default: time) -> time:
+    s = (s or "").strip()
+    if not s:
+        return default
+    try:
+        parts = s.split(":")
+        hh = int(parts[0])
+        mm = int(parts[1]) if len(parts) > 1 else 0
+        return time(hour=hh, minute=mm)
+    except Exception:
+        return default
 
 
 @dataclass(frozen=True)
@@ -19,7 +55,7 @@ class Settings:
     target_folder_id: str
     input_filename: str
 
-    # Parser
+    # Parser (night)
     max_items: int
     cities: list[str]
     min_delay_sec: float
@@ -29,6 +65,36 @@ class Settings:
     # Telegram
     telegram_bot_token: Optional[str]
     telegram_chat_ids: list[int]
+
+    # ---------------------------
+    # DAY competitors parser (new)
+    # ---------------------------
+
+    # enable/disable day parser
+    competitors_enabled: bool
+
+    # work window (local time)
+    competitors_window_start: time          # default 09:00
+    competitors_window_end: time            # default 21:00
+
+    # processing strategy
+    competitors_total_items: int            # default 300
+    competitors_max_items: int              # alias for competitors_total_items (compat)
+    competitors_batch_size: int             # default 100
+    competitors_items_per_hour: int         # default 100
+    competitors_cycle_hours: int            # default 3   (100/час * 3 часа = 300 товаров за цикл)
+    competitors_runs_per_day: int           # default 4  (4 прогона по 3 часа)
+    competitors_offers_per_product: int     # default 7  (5-7 предложений)
+    competitors_sellers_limit: int          # alias for competitors_offers_per_product (compat)
+
+    # URL building
+    competitors_city: str                   # default "kiev"
+
+    # output
+    competitors_output_filename: str        # default "competitors_delivery_total.json"
+    # DAY competitors parser (new)
+    competitors_excluded_sellers: list[str]     # default [] (patterns, case-insensitive)
+    competitors_excluded_card_ids: set[int]      # default set() (address-card id / data-card)
 
 
 def load_settings(env_path: str = ".env") -> Settings:
@@ -68,6 +134,36 @@ def load_settings(env_path: str = ".env") -> Settings:
         except ValueError:
             pass
 
+    # ---------------------------
+    # DAY competitors parser (new)
+    # ---------------------------
+    competitors_enabled = os.getenv("COMPETITORS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+
+    competitors_window_start = _parse_time_hhmm(
+        os.getenv("COMPETITORS_WINDOW_START", "09:00"),
+        default=time(9, 0),
+    )
+    competitors_window_end = _parse_time_hhmm(
+        os.getenv("COMPETITORS_WINDOW_END", "21:00"),
+        default=time(21, 0),
+    )
+
+    competitors_total_items = int(os.getenv("COMPETITORS_TOTAL_ITEMS", "300"))
+    competitors_max_items = int(os.getenv("COMPETITORS_MAX_ITEMS", str(competitors_total_items)))
+    competitors_batch_size = int(os.getenv("COMPETITORS_BATCH_SIZE", "100"))
+    competitors_items_per_hour = int(os.getenv("COMPETITORS_ITEMS_PER_HOUR", "100"))
+    competitors_cycle_hours = int(os.getenv("COMPETITORS_CYCLE_HOURS", "3"))
+    competitors_runs_per_day = int(os.getenv("COMPETITORS_RUNS_PER_DAY", "4"))
+    competitors_offers_per_product = int(os.getenv("COMPETITORS_OFFERS_PER_PRODUCT", "7"))
+    competitors_sellers_limit = int(
+        os.getenv("COMPETITORS_SELLERS_LIMIT", str(competitors_offers_per_product))
+    )
+
+    competitors_city = os.getenv("COMPETITORS_CITY", "kiev").strip() or "kiev"
+    competitors_output_filename = os.getenv("COMPETITORS_OUTPUT_FILENAME", "competitors_delivery_total.json").strip() or "competitors_delivery_total.json"
+    competitors_excluded_sellers = _parse_list(os.getenv("COMPETITORS_EXCLUDED_SELLERS", ""))
+    competitors_excluded_card_ids = _parse_int_set(os.getenv("COMPETITORS_EXCLUDED_CARD_IDS", ""))
+
     return Settings(
         google_credentials_path=google_credentials_path,
         source_folder_id=source_folder_id,
@@ -80,4 +176,20 @@ def load_settings(env_path: str = ".env") -> Settings:
         http_timeout_sec=http_timeout_sec,
         telegram_bot_token=telegram_bot_token,
         telegram_chat_ids=telegram_chat_ids,
+
+        competitors_enabled=competitors_enabled,
+        competitors_window_start=competitors_window_start,
+        competitors_window_end=competitors_window_end,
+        competitors_total_items=competitors_total_items,
+        competitors_batch_size=competitors_batch_size,
+        competitors_items_per_hour=competitors_items_per_hour,
+        competitors_cycle_hours=competitors_cycle_hours,
+        competitors_runs_per_day=competitors_runs_per_day,
+        competitors_offers_per_product=competitors_offers_per_product,
+        competitors_city=competitors_city,
+        competitors_output_filename=competitors_output_filename,
+        competitors_max_items=competitors_max_items,
+        competitors_sellers_limit=competitors_sellers_limit,
+        competitors_excluded_sellers=competitors_excluded_sellers,
+        competitors_excluded_card_ids=competitors_excluded_card_ids,
     )

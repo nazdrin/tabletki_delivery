@@ -2,7 +2,6 @@ from __future__ import annotations
 import random
 import re
 import asyncio
-import json
 import logging
 from typing import Optional
 from pathlib import Path
@@ -13,9 +12,6 @@ import httpx
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
 
-# Capture prices like "722", "722,00", "722.5", "722.50".
-# NOTE: start from 2 digits to avoid catching unrelated "1" from delivery=1, page=1, etc.
-_PRICE_RE = re.compile(r"\b(\d{2,5}(?:[.,]\d{1,2})?)\b")
 
 
 
@@ -52,44 +48,6 @@ class TabletkiScraper:
             "Connection": "keep-alive",
         }
 
-    def build_delivery_url(self, product_code: str, city_slug: str) -> str:
-        """Build initial delivery offers URL.
-
-        We start from the code-only path, then (if the server redirects to a slug-only page)
-        we re-fetch a stable URL that includes BOTH slug and product code.
-        """
-        product_code = str(product_code).strip().strip("/")
-        city_slug = str(city_slug).strip().strip("/")
-        return f"https://tabletki.ua/uk/{product_code}/pharmacy/{city_slug}/filter/delivery=1/"
-
-    def _extract_product_slug_from_final_url(self, final_url: str, city_slug: str) -> Optional[str]:
-        """Extract product slug from final URL.
-
-        Supported formats:
-        1) /uk/<slug>/pharmacy/<city>/...
-        2) /uk/<slug>/<code>/pharmacy/<city>/...
-        """
-        try:
-            p = urlparse(final_url)
-            parts = [x for x in p.path.split("/") if x]
-            # e.g. ['uk', '<slug>', 'pharmacy', '<city>', ...]
-            if len(parts) >= 4 and parts[0] == "uk" and parts[2] == "pharmacy" and parts[3] == city_slug:
-                return parts[1]
-            # e.g. ['uk', '<slug>', '<code>', 'pharmacy', '<city>', ...]
-            if len(parts) >= 5 and parts[0] == "uk" and parts[3] == "pharmacy" and parts[4] == city_slug:
-                return parts[1]
-        except Exception:
-            return None
-        return None
-
-    def _final_url_contains_code(self, final_url: str, product_code: str) -> bool:
-        """Return True if the final URL path still contains the product code segment."""
-        try:
-            p = urlparse(final_url)
-            parts = [x for x in p.path.split("/") if x]
-            return str(product_code) in parts
-        except Exception:
-            return False
 
     def _extract_slug_from_html_for_code(self, html: str, product_code: str) -> Optional[str]:
         """Try to find the canonical slug for a given product code inside HTML.
@@ -106,23 +64,6 @@ class TabletkiScraper:
             return m.group(1)
         return None
 
-    def _build_delivery_price_url(self, product_code: str, city_slug: str, product_slug: Optional[str] = None) -> str:
-        """Build stable delivery URL.
-
-        Stable format (no redirect, keeps correct product):
-        /uk/<slug>/<code>/pharmacy/<city>/filter/s=price;delivery=1/
-
-        If slug is unknown, falls back to the code-only URL.
-        """
-        product_code = str(product_code).strip().strip("/")
-        city_slug = str(city_slug).strip().strip("/")
-        if product_slug:
-            product_slug = str(product_slug).strip().strip("/")
-            return (
-                f"https://tabletki.ua/uk/{product_slug}/{product_code}/pharmacy/{city_slug}/"
-                "filter/s=price;delivery=1/"
-            )
-        return f"https://tabletki.ua/uk/{product_code}/pharmacy/{city_slug}/filter/delivery=1/"
 
     async def polite_sleep(self):
         # base delay from settings + small extra jitter to avoid rigid patterns
@@ -133,10 +74,10 @@ class TabletkiScraper:
     def _debug_dump_html(
         self,
         product_code: str,
-        city_slug: str,
         requested_url: str,
         final_url: str,
         html: str,
+        product_slug: Optional[str] = None,
     ) -> None:
         """Dump fetched HTML to disk for debugging purposes (only when LOG_LEVEL=DEBUG)."""
         if not self.logger.isEnabledFor(logging.DEBUG):
@@ -147,8 +88,12 @@ class TabletkiScraper:
         out_dir.mkdir(exist_ok=True)
 
         safe_code = re.sub(r"[^0-9A-Za-z_-]+", "_", str(product_code))
-        safe_city = re.sub(r"[^0-9A-Za-z_-]+", "_", str(city_slug))
-        path = out_dir / f"{ts}_{safe_code}_{safe_city}.html"
+        safe_slug = re.sub(r"[^0-9A-Za-z_-]+", "_", str(product_slug)) if product_slug else None
+        if safe_slug:
+            filename = f"{ts}_{safe_slug}_{safe_code}.html"
+        else:
+            filename = f"{ts}_{safe_code}.html"
+        path = out_dir / filename
 
         meta = (
             f"<!-- requested_url: {requested_url} -->\n"
@@ -203,202 +148,10 @@ class TabletkiScraper:
 
         return r.text, str(r.url)
 
-    def _extract_lowprice_from_jsonld(self, soup: BeautifulSoup) -> Optional[float]:
-        """Best source: JSON-LD on the page often contains AggregateOffer with lowPrice/highPrice."""
-        scripts = soup.find_all("script", attrs={"type": "application/ld+json"})
-        for s in scripts:
-            raw = (s.string or s.get_text() or "").strip()
-            if not raw:
-                continue
-            # Some pages include multiple JSON objects or invalid JSON; be defensive.
-            try:
-                data = json.loads(raw)
-            except Exception:
-                continue
-
-            # JSON-LD may be a dict or a list of dicts.
-            nodes = data if isinstance(data, list) else [data]
-            for node in nodes:
-                if not isinstance(node, dict):
-                    continue
-
-                # Common case: node has "offers" with AggregateOffer.
-                offers = node.get("offers")
-                low = self._jsonld_try_get_lowprice(offers)
-                if low is not None:
-                    return low
-
-                # Sometimes offers are nested deeper; also check common containers.
-                for key in ("@graph", "mainEntity", "itemListElement"):
-                    sub = node.get(key)
-                    if sub is None:
-                        continue
-                    low = self._jsonld_scan_any(sub)
-                    if low is not None:
-                        return low
-
-        return None
-
-    def _jsonld_try_get_lowprice(self, offers_obj) -> Optional[float]:
-        if offers_obj is None:
-            return None
-
-        # offers can be a dict (AggregateOffer) or a list.
-        if isinstance(offers_obj, list):
-            for it in offers_obj:
-                low = self._jsonld_try_get_lowprice(it)
-                if low is not None:
-                    return low
-            return None
-
-        if isinstance(offers_obj, dict):
-            # AggregateOffer case
-            if "lowPrice" in offers_obj:
-                return self._to_float_price(offers_obj.get("lowPrice"))
-            # Offer list can be under "offers" again
-            if "offers" in offers_obj:
-                return self._jsonld_try_get_lowprice(offers_obj.get("offers"))
-
-        return None
-
-    def _jsonld_scan_any(self, obj) -> Optional[float]:
-        """Depth-first scan for offers.lowPrice."""
-        if obj is None:
-            return None
-        if isinstance(obj, dict):
-            if "offers" in obj:
-                low = self._jsonld_try_get_lowprice(obj.get("offers"))
-                if low is not None:
-                    return low
-            for v in obj.values():
-                low = self._jsonld_scan_any(v)
-                if low is not None:
-                    return low
-            return None
-        if isinstance(obj, list):
-            for it in obj:
-                low = self._jsonld_scan_any(it)
-                if low is not None:
-                    return low
-        return None
-
-    def _to_float_price(self, v) -> Optional[float]:
-        if v is None:
-            return None
-        if isinstance(v, (int, float)):
-            f = float(v)
-            return f if f >= 10.0 else None
-        if isinstance(v, str):
-            vv = v.strip().replace(" ", "").replace(",", ".")
-            try:
-                f = float(vv)
-                return f if f >= 10.0 else None
-            except Exception:
-                return None
-        return None
-
-    def _extract_prices_best_effort(self, html: str) -> list[float]:
-        """Extract offer prices from the delivery-filtered pharmacy page.
-
-        We request `/pharmacy/<city>/filter/delivery=1/`, so the page should already be limited
-        to delivery offers. On this page the header text may differ from the product page block
-        ("Пропозиції з доставкою"), so we must not rely on that exact title.
-
-        Strategy:
-        1) Prefer structured hints: `itemprop=price`, meta/content, `data-price`.
-        2) Fallback to scanning visible text near common price containers.
-        """
-        soup = BeautifulSoup(html, "lxml")
-
-        low_jsonld = self._extract_lowprice_from_jsonld(soup)
-        if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug(f"JSON-LD lowPrice (if any): {low_jsonld}")
-
-        prices: list[float] = []
-        debug_sources: list[tuple[float, str]] = []
-
-        if low_jsonld is not None and 10.0 <= low_jsonld <= 100000.0:
-            prices.append(low_jsonld)
-            debug_sources.append((low_jsonld, "jsonld:lowPrice"))
-
-        # 1) Structured: itemprop=price (often used in offer cards)
-        for el in soup.select('[itemprop="price"], meta[itemprop="price"]'):
-            if el.name == "meta":
-                v = el.get("content")
-            else:
-                v = el.get("content") or el.get_text(" ", strip=True)
-            f = self._to_float_price(v)
-            if f is not None and 10.0 <= f <= 100000.0:
-                prices.append(f)
-                debug_sources.append((f, "itemprop=price"))
-
-        # 2) Structured: data-price attributes
-        for el in soup.select('[data-price], [data-offer-price], [data-product-price]'):
-            v = el.get("data-price") or el.get("data-offer-price") or el.get("data-product-price")
-            f = self._to_float_price(v)
-            if f is not None and 10.0 <= f <= 100000.0:
-                prices.append(f)
-                debug_sources.append((f, "data-price"))
-
-        # 3) Visible text: look inside likely price elements, but only inside delivery offer cards
-        if not prices:
-            likely = soup.select(
-                "[class*='delivery'] [class*='price'], "
-                "[class*='delivery'] span, "
-                "[class*='delivery'] div"
-            )
-            грн_re = re.compile(r"(\d[\d\s\u00a0]*[.,]?\d{0,2})\s*грн", re.IGNORECASE)
-            for el in likely:
-                txt = el.get_text(" ", strip=True)
-                if not txt or "грн" not in txt.lower():
-                    continue
-                for raw in грн_re.findall(txt):
-                    s = raw.replace("\u00a0", " ").replace(" ", "").replace(",", ".")
-                    try:
-                        f = float(s)
-                        if 10.0 <= f <= 100000.0:
-                            prices.append(f)
-                            debug_sources.append((f, "text:грн in element"))
-                    except Exception:
-                        pass
-        # --- END of main extraction logic ---
-        if self.logger.isEnabledFor(logging.DEBUG):
-            if prices:
-                uniq = sorted(set(prices))
-                self.logger.debug(
-                    f"Extracted {len(prices)} candidate prices (unique={len(uniq)}), min={min(prices)}"
-                )
-                self.logger.debug(f"First candidates: {uniq[:10]}")
-                self.logger.debug(f"Candidate prices with sources (first 15): {debug_sources[:15]}")
-            else:
-                # Helpful diagnostics: show page title and first h1/h2 texts
-                title = (soup.title.get_text(strip=True) if soup.title else "")
-                h1 = " | ".join([h.get_text(" ", strip=True) for h in soup.find_all("h1")][:2])
-                h2 = " | ".join([h.get_text(" ", strip=True) for h in soup.find_all("h2")][:2])
-                self.logger.debug(f"No candidate prices found. title='{title}' h1='{h1}' h2='{h2}'")
-
-        return prices
-    def _extract_delivery_tab_url(self, html: str) -> Optional[str]:
-        soup = BeautifulSoup(html, "lxml")
-        a = soup.select_one("a.btn.btn-radio.delivery[href]")
-        if not a:
-            return None
-        href = a.get("href")
-        if not href:
-            return None
-        # normalize odd tails like 'delivery=1;/' -> 'delivery=1/'
-        href = href.replace("delivery=1;/", "delivery=1/")
-        if href.startswith("http"):
-            return href
-        return "https://tabletki.ua" + href
-
-    def _final_url_is_delivery(self, final_url: str) -> bool:
-        return "delivery=1" in (final_url or "")
 
     async def get_min_delivery_price(
         self,
         product_code: str,
-        city_slug: str,
         product_slug: Optional[str] = None,
         **kwargs,
     ) -> Optional[float]:
@@ -414,7 +167,7 @@ class TabletkiScraper:
             code = str(product_code).strip().strip("/")
             slug = str(product_slug).strip().strip("/") if product_slug else None
 
-            # New approach: scrape from product card page (no city in URL).
+            # Scrape from product card page (no city in URL).
             if slug:
                 url = f"https://tabletki.ua/uk/{slug}/{code}/"
             else:
@@ -453,13 +206,12 @@ class TabletkiScraper:
                         url = stable_url
 
             if self.logger.isEnabledFor(logging.DEBUG):
-                # Keep city_slug only for debug filename compatibility
                 self._debug_dump_html(
                     product_code=code,
-                    city_slug=city_slug,
                     requested_url=url,
                     final_url=final_url,
                     html=html,
+                    product_slug=slug,
                 )
 
         price = self._extract_delivery_price_from_product_page(html)
