@@ -61,6 +61,10 @@ class BrowserFetcher:
             html = await self._page.content()
             return html
 
+    async def get_html(self, url: str, wait_ms: int = 1500, timeout_ms: int = 60000) -> str:
+        """Backward-compatible alias for older callers."""
+        return await self.fetch_html(url=url, wait_ms=wait_ms, timeout_ms=timeout_ms)
+
     async def aclose(self) -> None:
         async with self._lock:
             try:

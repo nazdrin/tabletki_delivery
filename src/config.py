@@ -24,11 +24,24 @@ def _parse_list(raw: str) -> list[str]:
 
 
 def _parse_int_set(raw: str) -> set[int]:
-    """Parse a set of ints from env allowing separators: comma, semicolon, pipe."""
+    """Parse a set of ints from env allowing separators: comma, semicolon, pipe.
+
+    Be tolerant to inputs like:
+      - "59677."
+      - "id=59677"
+      - "card:59677"
+    We extract the first integer-like sequence from each token.
+    """
     out: set[int] = set()
     for p in _parse_list(raw):
+        p = (p or "").strip()
+        if not p:
+            continue
+        m = re.search(r"(\d+)", p)
+        if not m:
+            continue
         try:
-            out.add(int(p))
+            out.add(int(m.group(1)))
         except ValueError:
             continue
     return out
@@ -96,6 +109,13 @@ class Settings:
     competitors_excluded_sellers: list[str]     # default [] (patterns, case-insensitive)
     competitors_excluded_card_ids: set[int]      # default set() (address-card id / data-card)
 
+    # Browser fallback / browser-first mode (for Cloudflare/403, especially on Windows)
+    competitors_use_browser_fetcher: bool        # default True
+    competitors_browser_first: bool              # default False
+    competitors_browser_headless: bool           # default True
+    competitors_browser_timeout_sec: float       # default 45
+    competitors_browser_extra_delay_sec: float   # default 2.0
+
 
 def load_settings(env_path: str = ".env") -> Settings:
     load_dotenv(env_path)
@@ -115,8 +135,7 @@ def load_settings(env_path: str = ".env") -> Settings:
 
     max_items = int(os.getenv("MAX_ITEMS", "100"))
 
-    cities_raw = os.getenv("CITIES", "kiev").strip()
-    cities = [c.strip() for c in cities_raw.split(",") if c.strip()]
+    cities = _parse_list(os.getenv("CITIES", "kiev"))
 
     min_delay_sec = float(os.getenv("MIN_DELAY_SEC", "2.0"))
     max_delay_sec = float(os.getenv("MAX_DELAY_SEC", "5.5"))
@@ -125,14 +144,11 @@ def load_settings(env_path: str = ".env") -> Settings:
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_ids_raw = os.getenv("TELEGRAM_CHAT_IDS", "")
     telegram_chat_ids: list[int] = []
-    for part in chat_ids_raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
+    for part in _parse_list(chat_ids_raw):
         try:
             telegram_chat_ids.append(int(part))
         except ValueError:
-            pass
+            continue
 
     # ---------------------------
     # DAY competitors parser (new)
@@ -164,6 +180,18 @@ def load_settings(env_path: str = ".env") -> Settings:
     competitors_excluded_sellers = _parse_list(os.getenv("COMPETITORS_EXCLUDED_SELLERS", ""))
     competitors_excluded_card_ids = _parse_int_set(os.getenv("COMPETITORS_EXCLUDED_CARD_IDS", ""))
 
+    competitors_use_browser_fetcher = os.getenv("COMPETITORS_USE_BROWSER_FETCHER", "1").strip().lower() in (
+        "1", "true", "yes", "y", "on"
+    )
+    competitors_browser_first = os.getenv("COMPETITORS_BROWSER_FIRST", "0").strip().lower() in (
+        "1", "true", "yes", "y", "on"
+    )
+    competitors_browser_headless = os.getenv("COMPETITORS_BROWSER_HEADLESS", "1").strip().lower() in (
+        "1", "true", "yes", "y", "on"
+    )
+    competitors_browser_timeout_sec = float(os.getenv("COMPETITORS_BROWSER_TIMEOUT_SEC", "45"))
+    competitors_browser_extra_delay_sec = float(os.getenv("COMPETITORS_BROWSER_EXTRA_DELAY_SEC", "2.0"))
+
     return Settings(
         google_credentials_path=google_credentials_path,
         source_folder_id=source_folder_id,
@@ -192,4 +220,10 @@ def load_settings(env_path: str = ".env") -> Settings:
         competitors_sellers_limit=competitors_sellers_limit,
         competitors_excluded_sellers=competitors_excluded_sellers,
         competitors_excluded_card_ids=competitors_excluded_card_ids,
+
+        competitors_use_browser_fetcher=competitors_use_browser_fetcher,
+        competitors_browser_first=competitors_browser_first,
+        competitors_browser_headless=competitors_browser_headless,
+        competitors_browser_timeout_sec=competitors_browser_timeout_sec,
+        competitors_browser_extra_delay_sec=competitors_browser_extra_delay_sec,
     )
