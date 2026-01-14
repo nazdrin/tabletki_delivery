@@ -126,6 +126,8 @@ class CompetitorsDeliveryScraper:
 
     async def _fetch_html_httpx(self, client: httpx.AsyncClient, url: str) -> str:
         r = await client.get(url, headers=self.headers, follow_redirects=True)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("HTTPX response: %s %s", r.status_code, url)
 
         if r.status_code == 429:
             ra = r.headers.get("Retry-After")
@@ -298,6 +300,17 @@ class CompetitorsDeliveryScraper:
     ) -> Tuple[Optional[float], List[SellerOffer]]:
         url = self.build_url(slug=slug, code=code, city=city)
 
+        # Visible fetch mode logging (helps to verify browser/http strategy in runtime logs)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "FETCH strategy: browser_first=%s use_browser=%s headless=%s (timeout=%.1fs extra_delay=%.1fs)",
+                self.browser_first,
+                self.use_browser_fetcher,
+                self.browser_headless,
+                self.browser_timeout_sec,
+                self.browser_extra_delay_sec,
+            )
+
         # Fetch strategy:
         # - browser_first=True: always fetch via BrowserFetcher (Playwright)
         # - else: try httpx, and if we hit 403 challenge -> fallback to BrowserFetcher (if enabled)
@@ -306,12 +319,16 @@ class CompetitorsDeliveryScraper:
         if self.browser_first and self.use_browser_fetcher and self._browser is not None:
             await self.polite_sleep()
             await self.browser_extra_sleep()
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("FETCH=BROWSER (browser_first) url=%s", url)
             html = await self._browser.get_html(url)
         else:
             timeout = httpx.Timeout(self.timeout_sec)
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
                 await self.polite_sleep()
                 try:
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        self.logger.debug("FETCH=HTTP url=%s", url)
                     html = await self._fetch_html(client, url)
                 except ForbiddenChallenge as ex:
                     if self.use_browser_fetcher and self._browser is not None:
@@ -320,6 +337,10 @@ class CompetitorsDeliveryScraper:
                         )
                         # Extra pause before browser fallback to reduce pressure
                         await self.browser_extra_sleep()
+                        if self.logger.isEnabledFor(logging.DEBUG):
+                            self.logger.debug(
+                                "FETCH=BROWSER (fallback after 403) url=%s", url
+                            )
                         html = await self._browser.get_html(url)
                     else:
                         # Re-raise so caller can apply cooldown/stop policy

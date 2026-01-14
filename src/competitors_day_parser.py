@@ -266,6 +266,11 @@ async def run_day_competitors_parser(settings, logger) -> None:
         min_delay=settings.min_delay_sec,
         max_delay=settings.max_delay_sec,
         logger=logger,
+        use_browser_fetcher=settings.competitors_use_browser_fetcher,
+        browser_first=settings.competitors_browser_first,
+        browser_headless=settings.competitors_browser_headless,
+        browser_timeout_sec=settings.competitors_browser_timeout_sec,
+        browser_extra_delay_sec=settings.competitors_browser_extra_delay_sec,
     )
 
     updates: Dict[str, float] = {}
