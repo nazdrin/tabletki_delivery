@@ -115,6 +115,7 @@ class Settings:
     competitors_browser_headless: bool           # default True
     competitors_browser_timeout_sec: float       # default 45
     competitors_browser_extra_delay_sec: float   # default 2.0
+    competitors_browser_profile_dir: str         # default "out/browser_profile" (persistent Playwright profile)
 
 
 def load_settings(env_path: str = ".env") -> Settings:
@@ -191,6 +192,12 @@ def load_settings(env_path: str = ".env") -> Settings:
     )
     competitors_browser_timeout_sec = float(os.getenv("COMPETITORS_BROWSER_TIMEOUT_SEC", "45"))
     competitors_browser_extra_delay_sec = float(os.getenv("COMPETITORS_BROWSER_EXTRA_DELAY_SEC", "2.0"))
+    competitors_browser_profile_dir = os.getenv("COMPETITORS_BROWSER_PROFILE_DIR", "out/browser_profile").strip()
+    # Allow disabling persistent profile by setting empty value
+    if not competitors_browser_profile_dir:
+        competitors_browser_profile_dir = ""
+    else:
+        competitors_browser_profile_dir = str(Path(competitors_browser_profile_dir).expanduser().resolve())
 
     return Settings(
         google_credentials_path=google_credentials_path,
@@ -226,4 +233,5 @@ def load_settings(env_path: str = ".env") -> Settings:
         competitors_browser_headless=competitors_browser_headless,
         competitors_browser_timeout_sec=competitors_browser_timeout_sec,
         competitors_browser_extra_delay_sec=competitors_browser_extra_delay_sec,
+        competitors_browser_profile_dir=competitors_browser_profile_dir,
     )

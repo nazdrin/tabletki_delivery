@@ -4,6 +4,10 @@ import asyncio
 import logging
 import random
 import re
+import os
+import inspect
+from datetime import datetime
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Sequence, Dict, Any
 
@@ -65,6 +69,7 @@ class CompetitorsDeliveryScraper:
         browser_headless: bool = True,
         browser_timeout_sec: float = 30.0,
         browser_extra_delay_sec: float = 2.0,
+        browser_profile_dir: Optional[str] = None,
     ):
         self.timeout_sec = timeout_sec
         self.min_delay = min_delay
@@ -76,13 +81,37 @@ class CompetitorsDeliveryScraper:
         self.browser_headless = bool(browser_headless)
         self.browser_timeout_sec = float(browser_timeout_sec)
         self.browser_extra_delay_sec = float(browser_extra_delay_sec)
+        self.browser_profile_dir = str(browser_profile_dir) if browser_profile_dir else None
 
         self._browser: Optional[Any] = None
         if self.use_browser_fetcher:
             if BrowserFetcher is None:
                 raise RuntimeError("BrowserFetcher is enabled but src/browser_fetcher.py is not available.")
             # Reuse a single browser instance across requests (important for speed and stability)
-            self._browser = BrowserFetcher(headless=self.browser_headless, timeout_sec=self.browser_timeout_sec)
+            bf_kwargs: Dict[str, Any] = {
+                "headless": self.browser_headless,
+                "timeout_sec": self.browser_timeout_sec,
+            }
+            # Persist browser profile (helps reduce repeated Cloudflare challenges)
+            if self.browser_profile_dir:
+                try:
+                    sig = inspect.signature(BrowserFetcher.__init__)  # type: ignore[attr-defined]
+                    if "profile_dir" in sig.parameters:
+                        bf_kwargs["profile_dir"] = self.browser_profile_dir
+                    else:
+                        self.logger.warning(
+                            "BrowserFetcher does not support profile_dir; running without persistent profile"
+                        )
+                except Exception:
+                    # If signature introspection fails, try passing profile_dir and fallback on TypeError
+                    bf_kwargs["profile_dir"] = self.browser_profile_dir
+
+            try:
+                self._browser = BrowserFetcher(**bf_kwargs)  # type: ignore[misc]
+            except TypeError:
+                # Backward-compatible fallback if BrowserFetcher does not accept profile_dir
+                bf_kwargs.pop("profile_dir", None)
+                self._browser = BrowserFetcher(**bf_kwargs)  # type: ignore[misc]
 
         self.headers = {
             "User-Agent": (
@@ -235,6 +264,50 @@ class CompetitorsDeliveryScraper:
     def _pick_primary_card_id(self, cands: List[str]) -> str:
         return cands[0] if cands else ""
 
+    def _debug_dump_no_offers(self, *, code: str, url: str, html: str, fetch_mode: str) -> None:
+        """Best-effort diagnostics when parsing returns no offers."""
+        try:
+            out_dir = Path("out") / "debug"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            safe_code = str(code).strip().replace("/", "_")
+            base = out_dir / f"no_offers_{safe_code}_{ts}"
+
+            # Save HTML
+            html_path = base.with_suffix(".html")
+            html_path.write_text(html or "", encoding="utf-8", errors="ignore")
+
+            # Quick signature checks
+            low = (html or "").lower()
+            markers = [
+                "cf-mitigated",
+                "cloudflare",
+                "/cdn-cgi/",
+                "turnstile",
+                "captcha",
+                "verify you are human",
+                "підтвердіть",
+                "ви людина",
+            ]
+            found = [m for m in markers if m in low]
+
+            snippet = (" ".join((html or "").split()))[:400]
+            self.logger.warning(
+                "NO_OFFERS debug saved: %s (mode=%s) url=%s markers=%s snippet=%s",
+                str(html_path),
+                fetch_mode,
+                url,
+                found,
+                snippet,
+            )
+        except Exception as e:
+            # Do not fail the run because of debug dumping
+            try:
+                self.logger.debug("NO_OFFERS debug dump failed: %r", e)
+            except Exception:
+                pass
+
     def parse_first_offers(
         self,
         html: str,
@@ -247,6 +320,9 @@ class CompetitorsDeliveryScraper:
         offers: List[SellerOffer] = []
         excluded_ids = {str(x).strip() for x in excluded_card_ids if str(x).strip()}
         cards = soup.select("div.address-card[data-card-id]")
+        if not cards:
+            # Some layouts may omit data-card-id on the outer card
+            cards = soup.select("div.address-card")
         for card in cards:
             if len(offers) >= limit:
                 break
@@ -303,18 +379,20 @@ class CompetitorsDeliveryScraper:
         # Visible fetch mode logging (helps to verify browser/http strategy in runtime logs)
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(
-                "FETCH strategy: browser_first=%s use_browser=%s headless=%s (timeout=%.1fs extra_delay=%.1fs)",
+                "FETCH strategy: browser_first=%s use_browser=%s headless=%s (timeout=%.1fs extra_delay=%.1fs profile_dir=%s)",
                 self.browser_first,
                 self.use_browser_fetcher,
                 self.browser_headless,
                 self.browser_timeout_sec,
                 self.browser_extra_delay_sec,
+                self.browser_profile_dir,
             )
 
         # Fetch strategy:
         # - browser_first=True: always fetch via BrowserFetcher (Playwright)
         # - else: try httpx, and if we hit 403 challenge -> fallback to BrowserFetcher (if enabled)
         html: str = ""
+        fetch_mode = ""
 
         if self.browser_first and self.use_browser_fetcher and self._browser is not None:
             await self.polite_sleep()
@@ -322,6 +400,7 @@ class CompetitorsDeliveryScraper:
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug("FETCH=BROWSER (browser_first) url=%s", url)
             html = await self._browser.get_html(url)
+            fetch_mode = "BROWSER:first"
         else:
             timeout = httpx.Timeout(self.timeout_sec)
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
@@ -330,6 +409,7 @@ class CompetitorsDeliveryScraper:
                     if self.logger.isEnabledFor(logging.DEBUG):
                         self.logger.debug("FETCH=HTTP url=%s", url)
                     html = await self._fetch_html(client, url)
+                    fetch_mode = "HTTP"
                 except ForbiddenChallenge as ex:
                     if self.use_browser_fetcher and self._browser is not None:
                         self.logger.warning(
@@ -342,9 +422,13 @@ class CompetitorsDeliveryScraper:
                                 "FETCH=BROWSER (fallback after 403) url=%s", url
                             )
                         html = await self._browser.get_html(url)
+                        fetch_mode = "BROWSER:fallback_403"
                     else:
                         # Re-raise so caller can apply cooldown/stop policy
                         raise
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("HTML fetched via %s (len=%d)", fetch_mode or "UNKNOWN", len(html or ""))
 
         offers = self.parse_first_offers(
             html,
@@ -353,6 +437,7 @@ class CompetitorsDeliveryScraper:
             excluded_card_ids=excluded_card_ids,
         )
         if not offers:
+            self._debug_dump_no_offers(code=str(code), url=url, html=html, fetch_mode=fetch_mode or "UNKNOWN")
             return None, []
 
         return min(o.price for o in offers), offers

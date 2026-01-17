@@ -1,0 +1,159 @@
+--- a/src/browser_fetcher.py
++++ b/src/browser_fetcher.py
+@@ -1,12 +1,13 @@
+ from __future__ import annotations
+
+ import asyncio
+ import logging
++import os
+ from pathlib import Path
+ from typing import Optional
+ import random
+ import re
+
+ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+@@ -33,6 +34,20 @@
+         self._context: Optional[BrowserContext] = None
+         self._page: Optional[Page] = None
+         self._lock = asyncio.Lock()
+
++        # Manual Cloudflare/Turnstile wait (NOT a bypass).
++        # When challenge is shown, we pause and let a human solve it in the opened browser window,
++        # then continue using the same persistent session (cookies/storage).
++        # Env:
++        #   COMPETITORS_TURNSTILE_MANUAL_WAIT=1 (default)
++        #   COMPETITORS_TURNSTILE_MAX_WAIT_SEC=600 (default 600)
++        self._turnstile_manual_wait = os.getenv("COMPETITORS_TURNSTILE_MANUAL_WAIT", "1").strip().lower() in (
++            "1", "true", "yes", "y", "on"
++        )
++        try:
++            self._turnstile_max_wait_sec = float(os.getenv("COMPETITORS_TURNSTILE_MAX_WAIT_SEC", "600"))
++        except Exception:
++            self._turnstile_max_wait_sec = 600.0
++
+     def _looks_like_cf_challenge(self, html: str) -> bool:
+         """Heuristic: detect Cloudflare challenge/turnstile pages."""
+         if not html:
+@@ -53,6 +68,83 @@
+             "ви людина",
+         )
+         return any(m in h for m in markers)
++
++    async def _wait_for_human_verification(self, url: str, timeout_ms: int) -> None:
++        """
++        Pause on CF/Turnstile and wait until a human solves it.
++        Does NOT solve automatically. Keeps the same page/session.
++        """
++        if not self._turnstile_manual_wait:
++            return
++
++        assert self._page is not None
++
++        # Bring window to front (best-effort).
++        try:
++            await self._page.bring_to_front()
++        except Exception:
++            pass
++
++        max_wait_sec = max(self._turnstile_max_wait_sec, 1.0)
++        deadline = asyncio.get_event_loop().time() + max_wait_sec
++
++        self.logger.warning(
++            "FETCH=TURNSTILE_WAIT url=%s (solve verification in browser window; max_wait=%.0fs)",
++            url,
++            max_wait_sec,
++        )
++
++        # If running in an interactive terminal, allow ENTER to continue after user solved it.
++        is_tty = False
++        try:
++            is_tty = bool(getattr(os.sys.stdin, "isatty", lambda: False)())
++        except Exception:
++            is_tty = False
++
++        async def _wait_enter() -> None:
++            try:
++                await asyncio.to_thread(
++                    input,
++                    "\n[TURNSTILE] Solve verification in browser, then press ENTER to continue... ",
++                )
++            except Exception:
++                return
++
++        enter_task: Optional[asyncio.Task] = None
++        if is_tty:
++            enter_task = asyncio.create_task(_wait_enter())
++
++        try:
++            while True:
++                if enter_task is not None and enter_task.done():
++                    break
++
++                html = await self._page.content()
++                if not self._looks_like_cf_challenge(html):
++                    break
++
++                if asyncio.get_event_loop().time() >= deadline:
++                    raise TimeoutError("Turnstile/CF verification not solved within the configured timeout")
++
++                # Idle while user interacts.
++                await self._page.wait_for_timeout(1000)
++
++            # After verification: try to stabilize and reload once.
++            try:
++                await self._page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 15000))
++            except Exception:
++                pass
++            try:
++                await self._page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
++            except Exception:
++                pass
++
++            self.logger.info("FETCH=BROWSER (after human verification) url=%s", url)
++        finally:
++            if enter_task is not None and not enter_task.done():
++                enter_task.cancel()
+
+     async def _ensure(self) -> None:
+         if self._page is not None:
+             return
+@@ -129,7 +221,8 @@
+             html = await self._page.content()
+
+             # If Cloudflare challenge is detected, give it some extra time to complete (non-interactive).
+             # This helps in cases where the first HTML is the "Please wait" page that later redirects.
+             if self._looks_like_cf_challenge(html):
+                 if self.logger.isEnabledFor(logging.DEBUG):
+                     self.logger.debug("[BrowserFetcher] CF/Turnstile challenge detected; waiting and re-checking...")
+
+                 for attempt in range(1, 4):
+                     extra = int(random.uniform(6.0, 12.0) * 1000)
+                     await self._page.wait_for_timeout(extra)
+                     try:
+                         await self._page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 15000))
+                     except Exception:
+                         pass
+
+                     html2 = await self._page.content()
+                     if not self._looks_like_cf_challenge(html2):
+                         html = html2
+                         break
+
+                     # Sometimes a reload helps after CF sets cookies.
+                     try:
+                         await self._page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+                     except Exception:
+                         pass
+
+                     html = html2
+                     if self.logger.isEnabledFor(logging.DEBUG):
+                         self.logger.debug(f"[BrowserFetcher] still looks like challenge (attempt {attempt}/3)")
++
++                # If still a challenge after passive waits -> stop and wait for manual verification.
++                if self._looks_like_cf_challenge(html):
++                    await self._wait_for_human_verification(url=url, timeout_ms=timeout_ms)
++                    html = await self._page.content()
+
+             if self.logger.isEnabledFor(logging.DEBUG):
+                 self.logger.debug(f"[BrowserFetcher] fetched html via BROWSER: {len(html)} bytes")
+             return html

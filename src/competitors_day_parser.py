@@ -212,6 +212,7 @@ async def run_day_competitors_parser(settings, logger) -> None:
       - competitors_window_start, competitors_window_end (time)
       - competitors_max_items (e.g. 300)
       - competitors_excluded_sellers: list of seller name patterns to skip
+      - competitors_browser_profile_dir (optional, path to persistent browser profile dir for Playwright)
     """
     plan = compute_day_plan(
         now=datetime.now(),
@@ -271,6 +272,7 @@ async def run_day_competitors_parser(settings, logger) -> None:
         browser_headless=settings.competitors_browser_headless,
         browser_timeout_sec=settings.competitors_browser_timeout_sec,
         browser_extra_delay_sec=settings.competitors_browser_extra_delay_sec,
+        browser_profile_dir=getattr(settings, "competitors_browser_profile_dir", None),
     )
 
     updates: Dict[str, float] = {}
