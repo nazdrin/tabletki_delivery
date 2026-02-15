@@ -105,6 +105,8 @@ class Settings:
 
     # output
     competitors_output_filename: str        # default "competitors_delivery_total.json"
+    competitors_save_every_minutes: int     # default 30
+    competitors_state_file: str             # default "out/competitors_state.json"
     # DAY competitors parser (new)
     competitors_excluded_sellers: list[str]     # default [] (patterns, case-insensitive)
     competitors_excluded_card_ids: set[int]      # default set() (address-card id / data-card)
@@ -178,6 +180,9 @@ def load_settings(env_path: str = ".env") -> Settings:
 
     competitors_city = os.getenv("COMPETITORS_CITY", "kiev").strip() or "kiev"
     competitors_output_filename = os.getenv("COMPETITORS_OUTPUT_FILENAME", "competitors_delivery_total.json").strip() or "competitors_delivery_total.json"
+    competitors_save_every_minutes = int(os.getenv("COMPETITORS_SAVE_EVERY_MINUTES", "30"))
+    competitors_state_file = os.getenv("COMPETITORS_STATE_FILE", "out/competitors_state.json").strip() or "out/competitors_state.json"
+    competitors_state_file = str(Path(competitors_state_file).expanduser().resolve())
     competitors_excluded_sellers = _parse_list(os.getenv("COMPETITORS_EXCLUDED_SELLERS", ""))
     competitors_excluded_card_ids = _parse_int_set(os.getenv("COMPETITORS_EXCLUDED_CARD_IDS", ""))
 
@@ -223,6 +228,8 @@ def load_settings(env_path: str = ".env") -> Settings:
         competitors_offers_per_product=competitors_offers_per_product,
         competitors_city=competitors_city,
         competitors_output_filename=competitors_output_filename,
+        competitors_save_every_minutes=competitors_save_every_minutes,
+        competitors_state_file=competitors_state_file,
         competitors_max_items=competitors_max_items,
         competitors_sellers_limit=competitors_sellers_limit,
         competitors_excluded_sellers=competitors_excluded_sellers,
